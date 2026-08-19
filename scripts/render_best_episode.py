@@ -10,11 +10,12 @@ from envs.g1_env import G1Env
 
 
 NUM_EPISODES = 10
+VIDEO_PATH = "results/best_episode.mp4"
 
-VIDEO_PATH = (
-    "results/best_episode.mp4"
-)
 
+# --------------------------------------------------
+# Setup
+# --------------------------------------------------
 
 env = G1Env()
 
@@ -26,7 +27,6 @@ device = (
     if torch.backends.mps.is_available()
     else "cpu"
 )
-
 
 agent = PPO(
     obs_dim=obs_dim,
@@ -41,13 +41,13 @@ agent.load(
 agent.network.eval()
 
 
+# --------------------------------------------------
+# Find best deterministic episode
+# --------------------------------------------------
+
 best_reward = -np.inf
 best_actions = None
 
-
-# -----------------------------------
-# Evaluate deterministic episodes
-# -----------------------------------
 
 for episode in range(NUM_EPISODES):
 
@@ -55,7 +55,6 @@ for episode in range(NUM_EPISODES):
 
     done = False
     total_reward = 0.0
-
     episode_actions = []
 
     while not done:
@@ -68,10 +67,8 @@ for episode in range(NUM_EPISODES):
 
         with torch.no_grad():
 
-            raw_mean = (
-                agent.network.actor(
-                    obs_tensor
-                )
+            raw_mean = agent.network.actor(
+                obs_tensor
             )
 
             action = torch.tanh(
@@ -111,10 +108,7 @@ for episode in range(NUM_EPISODES):
     if total_reward > best_reward:
 
         best_reward = total_reward
-
-        best_actions = (
-            episode_actions
-        )
+        best_actions = episode_actions
 
 
 print()
@@ -123,9 +117,9 @@ print(
 )
 
 
-# -----------------------------------
+# --------------------------------------------------
 # Render best episode
-# -----------------------------------
+# --------------------------------------------------
 
 os.makedirs(
     "results",
@@ -140,6 +134,25 @@ renderer = mujoco.Renderer(
     width=640,
 )
 
+
+# --------------------------------------------------
+# Camera
+# --------------------------------------------------
+
+camera = mujoco.MjvCamera()
+
+mujoco.mjv_defaultCamera(
+    camera
+)
+
+# Side / slightly diagonal view
+camera.azimuth = 135
+camera.elevation = -12
+
+# Distance from robot
+camera.distance = 3.0
+
+
 frames = []
 
 
@@ -153,8 +166,25 @@ for action in best_actions:
         info,
     ) = env.step(action)
 
+    # --------------------------------------------------
+    # Lock camera onto G1
+    # --------------------------------------------------
+
+    # Floating base position
+    base_x = env.data.qpos[0]
+    base_y = env.data.qpos[1]
+    base_z = env.data.qpos[2]
+
+    camera.lookat[:] = [
+        base_x,
+        base_y,
+        base_z * 0.65,
+    ]
+
+    # Update rendered scene using tracking camera
     renderer.update_scene(
-        env.data
+        env.data,
+        camera=camera,
     )
 
     frame = renderer.render()
@@ -167,6 +197,10 @@ for action in best_actions:
         break
 
 
+# --------------------------------------------------
+# Save video
+# --------------------------------------------------
+
 fps = int(
     1.0
     / (
@@ -175,18 +209,17 @@ fps = int(
     )
 )
 
-
 imageio.mimsave(
     VIDEO_PATH,
     frames,
     fps=fps,
 )
 
-
 renderer.close()
 env.close()
 
 
+print()
 print(
     f"Video saved to: {VIDEO_PATH}"
 )

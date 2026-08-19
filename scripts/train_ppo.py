@@ -1,4 +1,5 @@
 import os
+import csv
 from collections import deque
 
 import numpy as np
@@ -8,9 +9,15 @@ from algorithms.ppo import PPO
 from envs.g1_env import G1Env
 
 
-TOTAL_TIMESTEPS = 50_000
+TOTAL_TIMESTEPS = 1_000_000
 ROLLOUT_STEPS = 2048
 SMOOTH_WINDOW = 20
+
+CSV_PATH = "results/training_log.csv"
+
+
+os.makedirs("results", exist_ok=True)
+os.makedirs("checkpoints", exist_ok=True)
 
 
 env = G1Env()
@@ -23,6 +30,7 @@ device = (
     if torch.backends.mps.is_available()
     else "cpu"
 )
+
 
 print("Device:", device)
 print("Observation dimension:", obs_dim)
@@ -38,13 +46,45 @@ agent = PPO(
 )
 
 
+with open(
+    CSV_PATH,
+    "w",
+    newline="",
+) as csv_file:
+
+    writer = csv.writer(
+        csv_file
+    )
+
+    writer.writerow([
+        "episode",
+        "global_step",
+        "episode_reward",
+        "smooth_reward",
+        "mean_vx",
+        "episode_length",
+        "mean_height",
+        "mean_upright",
+        "left_contact_ratio",
+        "right_contact_ratio",
+        "single_support_ratio",
+    ])
+
+
 obs, _ = env.reset()
 
 global_step = 0
 episode_number = 0
 
 episode_reward = 0.0
+
 episode_vx = []
+episode_height = []
+episode_upright = []
+
+left_contacts = []
+right_contacts = []
+single_support = []
 
 recent_rewards = deque(
     maxlen=SMOOTH_WINDOW
@@ -90,12 +130,25 @@ while global_step < TOTAL_TIMESTEPS:
             raw_action.copy()
         )
 
-        rewards.append(reward)
-        dones.append(float(done))
-        log_probs.append(log_prob)
-        values.append(value)
+        rewards.append(
+            reward
+        )
+
+        dones.append(
+            float(done)
+        )
+
+        log_probs.append(
+            log_prob
+        )
+
+        values.append(
+            value
+        )
 
         obs = next_obs
+
+        global_step += 1
 
         episode_reward += reward
 
@@ -103,10 +156,60 @@ while global_step < TOTAL_TIMESTEPS:
             info["forward_velocity"]
         )
 
-        global_step += 1
+        episode_height.append(
+            info["height"]
+        )
+
+        episode_upright.append(
+            info["upright"]
+        )
+
+        left_contacts.append(
+            info["left_contact"]
+        )
+
+        right_contacts.append(
+            info["right_contact"]
+        )
+
+        single_support.append(
+            int(
+                info["left_contact"]
+                != info["right_contact"]
+            )
+        )
 
         if done:
+
             episode_number += 1
+
+            episode_length = len(
+                episode_vx
+            )
+
+            mean_vx = float(
+                np.mean(episode_vx)
+            )
+
+            mean_height = float(
+                np.mean(episode_height)
+            )
+
+            mean_upright = float(
+                np.mean(episode_upright)
+            )
+
+            left_contact_ratio = float(
+                np.mean(left_contacts)
+            )
+
+            right_contact_ratio = float(
+                np.mean(right_contacts)
+            )
+
+            single_support_ratio = float(
+                np.mean(single_support)
+            )
 
             recent_rewards.append(
                 episode_reward
@@ -116,26 +219,57 @@ while global_step < TOTAL_TIMESTEPS:
                 np.mean(recent_rewards)
             )
 
-            mean_vx = float(
-                np.mean(episode_vx)
-            )
-
             print(
                 f"Episode {episode_number:4d} | "
                 f"Step {global_step:7d} | "
                 f"Reward {episode_reward:8.2f} | "
-                f"Avg({len(recent_rewards):2d}) "
-                f"{smooth_reward:8.2f} | "
-                f"Mean vx {mean_vx:5.3f} | "
-                f"Length {len(episode_vx):4d}"
+                f"Avg {smooth_reward:8.2f} | "
+                f"vx {mean_vx:6.3f} | "
+                f"Length {episode_length:4d} | "
+                f"SingleSupport "
+                f"{single_support_ratio:5.2f}"
             )
+
+            with open(
+                CSV_PATH,
+                "a",
+                newline="",
+            ) as csv_file:
+
+                writer = csv.writer(
+                    csv_file
+                )
+
+                writer.writerow([
+                    episode_number,
+                    global_step,
+                    episode_reward,
+                    smooth_reward,
+                    mean_vx,
+                    episode_length,
+                    mean_height,
+                    mean_upright,
+                    left_contact_ratio,
+                    right_contact_ratio,
+                    single_support_ratio,
+                ])
 
             obs, _ = env.reset()
 
             episode_reward = 0.0
-            episode_vx = []
 
-        if global_step >= TOTAL_TIMESTEPS:
+            episode_vx = []
+            episode_height = []
+            episode_upright = []
+
+            left_contacts = []
+            right_contacts = []
+            single_support = []
+
+        if (
+            global_step
+            >= TOTAL_TIMESTEPS
+        ):
             break
 
     obs_tensor = torch.as_tensor(
@@ -145,6 +279,7 @@ while global_step < TOTAL_TIMESTEPS:
     ).unsqueeze(0)
 
     with torch.no_grad():
+
         next_value = (
             agent.network
             .critic(obs_tensor)
@@ -180,11 +315,6 @@ while global_step < TOTAL_TIMESTEPS:
         f"at step {global_step} ---"
     )
 
-    os.makedirs(
-        "checkpoints",
-        exist_ok=True,
-    )
-
     agent.save(
         "checkpoints/g1_ppo.pt"
     )
@@ -192,4 +322,8 @@ while global_step < TOTAL_TIMESTEPS:
 
 env.close()
 
+print()
 print("Training complete.")
+print(
+    f"Training log saved to: {CSV_PATH}"
+)
