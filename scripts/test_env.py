@@ -5,21 +5,28 @@ env = G1Env()
 
 obs, info = env.reset()
 
+print("G1 environment loaded")
 print(
-    "Observation:",
+    "Observation shape:",
     obs.shape,
 )
-
 print(
-    "Action:",
+    "Action shape:",
     env.action_space.shape,
 )
+print(
+    "Target velocity:",
+    env.target_velocity,
+)
+print(
+    "Standing height:",
+    env.target_height,
+)
+print()
+
 
 for step in range(100):
-
-    action = (
-        env.action_space.sample()
-    )
+    action = env.action_space.sample()
 
     (
         obs,
@@ -31,14 +38,13 @@ for step in range(100):
 
     print(
         f"{step:3d} | "
-        f"reward={reward:.3f} | "
-        f"vx={info['forward_velocity']:.3f} | "
-        f"height={info['height']:.3f}"
+        f"reward={reward:6.3f} | "
+        f"vx={info['forward_velocity']:6.3f} | "
+        f"height={info['height']:6.3f}"
     )
 
     if terminated or truncated:
-        print("Reset")
-
+        print("Episode ended -- resetting")
         obs, info = env.reset()
 
 

@@ -1,20 +1,20 @@
 import os
-import numpy as np
-import torch
+
 import imageio
 import mujoco
+import numpy as np
+import torch
 
-from envs.g1_env import G1Env
 from algorithms.ppo import PPO
+from envs.g1_env import G1Env
 
 
 NUM_EPISODES = 10
-VIDEO_PATH = "results/best_episode.mp4"
 
+VIDEO_PATH = (
+    "results/best_episode.mp4"
+)
 
-# --------------------------------------------------
-# Setup
-# --------------------------------------------------
 
 env = G1Env()
 
@@ -27,22 +27,27 @@ device = (
     else "cpu"
 )
 
+
 agent = PPO(
-    obs_dim,
-    action_dim,
+    obs_dim=obs_dim,
+    action_dim=action_dim,
     device=device,
 )
 
-agent.load("checkpoints/g1_ppo.pt")
+agent.load(
+    "checkpoints/g1_ppo.pt"
+)
+
 agent.network.eval()
 
 
-# --------------------------------------------------
-# Evaluate and find best episode
-# --------------------------------------------------
-
 best_reward = -np.inf
 best_actions = None
+
+
+# -----------------------------------
+# Evaluate deterministic episodes
+# -----------------------------------
 
 for episode in range(NUM_EPISODES):
 
@@ -50,31 +55,33 @@ for episode in range(NUM_EPISODES):
 
     done = False
     total_reward = 0.0
+
     episode_actions = []
 
     while not done:
 
-        obs_tensor = torch.tensor(
+        obs_tensor = torch.as_tensor(
             obs,
             dtype=torch.float32,
             device=device,
         ).unsqueeze(0)
 
-        # Deterministic evaluation:
-        # use actor mean instead of sampling
         with torch.no_grad():
-            action = agent.network.actor(obs_tensor)
+
+            raw_mean = (
+                agent.network.actor(
+                    obs_tensor
+                )
+            )
+
+            action = torch.tanh(
+                raw_mean
+            )
 
         action = (
             action.squeeze(0)
             .cpu()
             .numpy()
-        )
-
-        action = np.clip(
-            action,
-            -1.0,
-            1.0,
         )
 
         episode_actions.append(
@@ -91,7 +98,10 @@ for episode in range(NUM_EPISODES):
 
         total_reward += reward
 
-        done = terminated or truncated
+        done = (
+            terminated
+            or truncated
+        )
 
     print(
         f"Episode {episode + 1}: "
@@ -101,18 +111,26 @@ for episode in range(NUM_EPISODES):
     if total_reward > best_reward:
 
         best_reward = total_reward
-        best_actions = episode_actions
+
+        best_actions = (
+            episode_actions
+        )
 
 
 print()
-print(f"Best reward: {best_reward:.2f}")
+print(
+    f"Best reward: {best_reward:.2f}"
+)
 
 
-# --------------------------------------------------
-# Replay best episode and render it
-# --------------------------------------------------
+# -----------------------------------
+# Render best episode
+# -----------------------------------
 
-os.makedirs("results", exist_ok=True)
+os.makedirs(
+    "results",
+    exist_ok=True,
+)
 
 obs, _ = env.reset()
 
@@ -123,6 +141,7 @@ renderer = mujoco.Renderer(
 )
 
 frames = []
+
 
 for action in best_actions:
 
@@ -135,20 +154,18 @@ for action in best_actions:
     ) = env.step(action)
 
     renderer.update_scene(
-        env.data,
+        env.data
     )
 
     frame = renderer.render()
 
-    frames.append(frame)
+    frames.append(
+        frame.copy()
+    )
 
     if terminated or truncated:
         break
 
-
-# --------------------------------------------------
-# Save video
-# --------------------------------------------------
 
 fps = int(
     1.0
@@ -158,14 +175,18 @@ fps = int(
     )
 )
 
+
 imageio.mimsave(
     VIDEO_PATH,
     frames,
     fps=fps,
 )
 
+
 renderer.close()
 env.close()
 
-print()
-print(f"Video saved to: {VIDEO_PATH}")
+
+print(
+    f"Video saved to: {VIDEO_PATH}"
+)

@@ -1,8 +1,9 @@
 import os
-import numpy as np
+
 import gymnasium as gym
-from gymnasium import spaces
 import mujoco
+import numpy as np
+from gymnasium import spaces
 
 
 class G1Env(gym.Env):
@@ -13,7 +14,9 @@ class G1Env(gym.Env):
             "~/Documents/mujoco_menagerie/unitree_g1/scene.xml"
         )
 
-        self.model = mujoco.MjModel.from_xml_path(self.model_path)
+        self.model = mujoco.MjModel.from_xml_path(
+            self.model_path
+        )
         self.data = mujoco.MjData(self.model)
 
         # Find standing keyframe
@@ -24,16 +27,28 @@ class G1Env(gym.Env):
         )
 
         if self.stand_id == -1:
-            raise RuntimeError("Could not find G1 'stand' keyframe.")
+            raise RuntimeError(
+                "Could not find G1 'stand' keyframe."
+            )
 
-        # Save standing actuator targets
-        self.stand_ctrl = self.model.key_ctrl[self.stand_id].copy()
+        # Actuator commands for standing pose
+        self.stand_ctrl = (
+            self.model.key_ctrl[self.stand_id].copy()
+        )
+
+        # Use actual standing height from model
+        self.target_height = float(
+            self.model.key_qpos[self.stand_id][2]
+        )
 
         self.action_dim = self.model.nu
 
-        # Observation:
-        # qpos + qvel
-        self.obs_dim = self.model.nq + self.model.nv
+        # qpos + qvel + previous action
+        self.obs_dim = (
+            self.model.nq
+            + self.model.nv
+            + self.action_dim
+        )
 
         self.action_space = spaces.Box(
             low=-1.0,
@@ -49,24 +64,127 @@ class G1Env(gym.Env):
             dtype=np.float32,
         )
 
-        # How far PPO can move joints away from standing pose
-        self.action_scale = 0.25
+        # Policy changes joint targets around standing pose
+        self.action_scale = 0.20
 
-        # MuJoCo physics steps per PPO action
+        # MuJoCo physics steps per RL step
         self.frame_skip = 5
 
-        self.current_step = 0
         self.max_steps = 1000
+        self.current_step = 0
+
+        # Walking target
+        self.target_velocity = 0.6
+
+        self.previous_action = np.zeros(
+            self.action_dim,
+            dtype=np.float32,
+        )
 
     def _get_obs(self):
-        return np.concatenate(
-            [
-                self.data.qpos.copy(),
-                self.data.qvel.copy(),
-            ]
-        ).astype(np.float32)
+        return np.concatenate([
+            self.data.qpos.copy(),
+            self.data.qvel.copy(),
+            self.previous_action.copy(),
+        ]).astype(np.float32)
 
-    def reset(self, seed=None, options=None):
+    def _upright_value(self):
+        quat = self.data.qpos[3:7]
+
+        rotation = np.zeros(9)
+
+        mujoco.mju_quat2Mat(
+            rotation,
+            quat,
+        )
+
+        rotation = rotation.reshape(3, 3)
+
+        return float(rotation[2, 2])
+
+    def _get_reward(self, action):
+        vx = float(self.data.qvel[0])
+        vy = float(self.data.qvel[1])
+        yaw_rate = float(self.data.qvel[5])
+
+        height = float(self.data.qpos[2])
+
+        # Target forward velocity
+        velocity_error = (
+            vx - self.target_velocity
+        )
+
+        velocity_reward = np.exp(
+            -8.0 * velocity_error**2
+        )
+
+        upright_reward = self._upright_value()
+
+        height_reward = np.exp(
+            -10.0
+            * (height - self.target_height) ** 2
+        )
+
+        lateral_penalty = vy**2
+
+        yaw_penalty = yaw_rate**2
+
+        action_penalty = np.mean(
+            action**2
+        )
+
+        action_rate_penalty = np.mean(
+            (
+                action
+                - self.previous_action
+            ) ** 2
+        )
+
+        reward = (
+            4.0 * velocity_reward
+            + 0.5 * upright_reward
+            + 0.2 * height_reward
+            - 0.20 * lateral_penalty
+            - 0.10 * yaw_penalty
+            - 0.01 * action_penalty
+            - 0.02 * action_rate_penalty
+        )
+
+        return float(reward)
+
+    def _is_terminated(self):
+        height = float(
+            self.data.qpos[2]
+        )
+
+        upright = self._upright_value()
+
+        # Fall
+        if height < self.target_height * 0.70:
+            return True
+
+        # Large tilt
+        if upright < 0.5:
+            return True
+
+        # Numerical instability
+        if not np.isfinite(
+            self.data.qpos
+        ).all():
+            return True
+
+        if not np.isfinite(
+            self.data.qvel
+        ).all():
+            return True
+
+        return False
+
+    def reset(
+        self,
+        seed=None,
+        options=None,
+    ):
         super().reset(seed=seed)
 
         mujoco.mj_resetDataKeyframe(
@@ -75,27 +193,41 @@ class G1Env(gym.Env):
             self.stand_id,
         )
 
+        self.previous_action[:] = 0.0
+
+        self.current_step = 0
+
         mujoco.mj_forward(
             self.model,
             self.data,
         )
 
-        self.current_step = 0
-
         return self._get_obs(), {}
 
     def step(self, action):
-        action = np.clip(action, -1.0, 1.0)
+        action = np.asarray(
+            action,
+            dtype=np.float32,
+        )
 
-        # PPO controls deviations from standing pose
+        action = np.clip(
+            action,
+            -1.0,
+            1.0,
+        )
+
         target_ctrl = (
             self.stand_ctrl
             + self.action_scale * action
         )
 
-        # Respect actuator limits
-        ctrl_min = self.model.actuator_ctrlrange[:, 0]
-        ctrl_max = self.model.actuator_ctrlrange[:, 1]
+        ctrl_min = (
+            self.model.actuator_ctrlrange[:, 0]
+        )
+
+        ctrl_max = (
+            self.model.actuator_ctrlrange[:, 1]
+        )
 
         target_ctrl = np.clip(
             target_ctrl,
@@ -113,47 +245,44 @@ class G1Env(gym.Env):
 
         self.current_step += 1
 
-        obs = self._get_obs()
-
-        forward_velocity = float(
-            self.data.qvel[0]
-        )
-
-        height = float(
-            self.data.qpos[2]
-        )
-
-        # Simple first reward
-        forward_reward = forward_velocity
-        alive_reward = 1.0
-
-        action_penalty = (
-            0.01 * np.sum(action ** 2)
-        )
-
-        reward = (
-            forward_reward
-            + alive_reward
-            - action_penalty
+        reward = self._get_reward(
+            action
         )
 
         terminated = (
-            height < 0.5
-            or not np.isfinite(obs).all()
+            self._is_terminated()
         )
 
         truncated = (
-            self.current_step >= self.max_steps
+            self.current_step
+            >= self.max_steps
         )
 
         info = {
-            "forward_velocity": forward_velocity,
-            "height": height,
+            "forward_velocity": float(
+                self.data.qvel[0]
+            ),
+            "lateral_velocity": float(
+                self.data.qvel[1]
+            ),
+            "height": float(
+                self.data.qpos[2]
+            ),
+            "upright": (
+                self._upright_value()
+            ),
+            "target_velocity": (
+                self.target_velocity
+            ),
         }
 
+        self.previous_action = (
+            action.copy()
+        )
+
         return (
-            obs,
-            float(reward),
+            self._get_obs(),
+            reward,
             terminated,
             truncated,
             info,
