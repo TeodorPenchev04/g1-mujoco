@@ -1,11 +1,14 @@
 import numpy as np
 import torch
+from pathlib import Path
 
 from algorithms.ppo import PPO
 from envs.g1_env import G1Env
 
 
 NUM_EPISODES = 10
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+CHECKPOINT_PATH = PROJECT_ROOT / "checkpoints" / "g1_ppo.pt"
 
 
 env = G1Env()
@@ -27,7 +30,7 @@ agent = PPO(
 )
 
 agent.load(
-    "checkpoints/g1_ppo.pt"
+    str(CHECKPOINT_PATH)
 )
 
 agent.network.eval()

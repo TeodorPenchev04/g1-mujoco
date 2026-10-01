@@ -1,11 +1,13 @@
-import os
+from pathlib import Path
 
 import matplotlib.pyplot as plt
 import pandas as pd
 
 
-CSV_PATH = "results/training_log.csv"
-OUTPUT_PATH = "results/training_curve.png"
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+RESULTS_DIR = PROJECT_ROOT / "results"
+CSV_PATH = RESULTS_DIR / "training_log.csv"
+OUTPUT_PATH = RESULTS_DIR / "training_curve.png"
 
 
 # Load training data
@@ -40,7 +42,7 @@ plt.grid(alpha=0.3)
 plt.tight_layout()
 
 # Save
-os.makedirs("results", exist_ok=True)
+RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 
 plt.savefig(
     OUTPUT_PATH,

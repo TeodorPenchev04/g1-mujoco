@@ -40,10 +40,11 @@ Clone the G1 model separately:
 git clone https://github.com/google-deepmind/mujoco_menagerie.git
 ```
 
-The environment currently expects:
+Place `mujoco_menagerie` as a sibling of this repository. The environment then
+resolves the model at:
 
 ```text
-~/Documents/mujoco_menagerie/unitree_g1/scene.xml
+../mujoco_menagerie/unitree_g1/scene.xml
 ```
 
 ## Run

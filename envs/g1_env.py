@@ -1,4 +1,4 @@
-import os
+from pathlib import Path
 
 import gymnasium as gym
 import mujoco
@@ -6,16 +6,39 @@ import numpy as np
 from gymnasium import spaces
 
 
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+MENAGERIE_ROOT = PROJECT_ROOT.parent / "mujoco_menagerie"
+MODEL_PATH = MENAGERIE_ROOT / "unitree_g1" / "scene.xml"
+
+
 class G1Env(gym.Env):
+    """
+    MuJoCo Unitree G1 velocity-tracking locomotion environment.
+
+    Reward design is inspired by the Isaac Lab G1 locomotion task:
+    - commanded velocity tracking
+    - biped single-support timing
+    - swing-foot clearance
+    - foot-slip suppression
+    - upright posture
+    - smooth action targets
+    - selective posture regularization
+    - ankle-limit regularization
+    - small effort / acceleration penalties
+    """
+
     def __init__(self):
         super().__init__()
 
-        self.model_path = os.path.expanduser(
-            "~/Documents/mujoco_menagerie/unitree_g1/scene.xml"
-        )
+        self.model_path = MODEL_PATH
+
+        if not self.model_path.is_file():
+            raise FileNotFoundError(
+                f"Could not find MuJoCo model at:\n{self.model_path}"
+            )
 
         self.model = mujoco.MjModel.from_xml_path(
-            self.model_path
+            str(self.model_path)
         )
         self.data = mujoco.MjData(self.model)
 
@@ -38,16 +61,25 @@ class G1Env(gym.Env):
             self.model.key_ctrl[self.stand_id].copy()
         )
 
+        self.stand_qpos = (
+            self.model.key_qpos[self.stand_id].copy()
+        )
+
         self.target_height = float(
-            self.model.key_qpos[self.stand_id][2]
+            self.stand_qpos[2]
         )
 
         # --------------------------------------------------
         # Feet
         # --------------------------------------------------
 
-        self.left_foot_id = self._find_foot_body("left")
-        self.right_foot_id = self._find_foot_body("right")
+        self.left_foot_id = self._find_foot_body(
+            "left"
+        )
+
+        self.right_foot_id = self._find_foot_body(
+            "right"
+        )
 
         print(
             "Left foot:",
@@ -65,6 +97,37 @@ class G1Env(gym.Env):
                 mujoco.mjtObj.mjOBJ_BODY,
                 self.right_foot_id,
             ),
+        )
+
+        # --------------------------------------------------
+        # Joints used for posture regularization
+        # --------------------------------------------------
+
+        # Keep these joints relatively close to the standing
+        # posture while leaving the primary walking joints
+        # freer to generate locomotion.
+        self.posture_qpos_indices = (
+            self._find_hinge_qpos_indices(
+                [
+                    "hip_yaw",
+                    "hip_roll",
+                    "waist",
+                    "torso",
+                    "shoulder_pitch",
+                    "shoulder_roll",
+                    "shoulder_yaw",
+                    "elbow",
+                ]
+            )
+        )
+
+        self.ankle_joint_ids = (
+            self._find_joint_ids(
+                [
+                    "ankle_pitch",
+                    "ankle_roll",
+                ]
+            )
         )
 
         # --------------------------------------------------
@@ -98,23 +161,71 @@ class G1Env(gym.Env):
         # --------------------------------------------------
 
         self.action_scale = 0.10
+
         self.frame_skip = 5
+
+        self.control_dt = (
+            self.model.opt.timestep
+            * self.frame_skip
+        )
 
         self.max_steps = 1000
         self.current_step = 0
 
+        # --------------------------------------------------
+        # Velocity command
+        # --------------------------------------------------
+
+        # Keep the command fixed for now.
+        #
+        # If we later randomize this during training,
+        # target velocity should also be added to the
+        # observation vector.
         self.target_velocity = 0.30
+        self.target_lateral_velocity = 0.0
+        self.target_yaw_rate = 0.0
+
+        self.velocity_tracking_std = 0.50
+        self.yaw_tracking_std = 0.50
+
+        # --------------------------------------------------
+        # Biped gait parameters
+        # --------------------------------------------------
+
+        # Same basic threshold used in the Isaac G1
+        # reference.
+        self.air_time_threshold = 0.40
+
+        # Desired swing-foot height above nominal standing
+        # foot height.
+        self.target_clearance = 0.08
+
+        self.nominal_left_foot_z = 0.0
+        self.nominal_right_foot_z = 0.0
+
+        # --------------------------------------------------
+        # Previous actions / contact state
+        # --------------------------------------------------
 
         self.previous_action = np.zeros(
             self.action_dim,
             dtype=np.float32,
         )
 
+        self.previous_target_ctrl = (
+            self.stand_ctrl.copy()
+        )
+
         self.previous_left_contact = True
         self.previous_right_contact = True
 
-        self.left_swing_count = 0
-        self.right_swing_count = 0
+        self.left_air_time = 0.0
+        self.right_air_time = 0.0
+
+        self.left_contact_time = 0.0
+        self.right_contact_time = 0.0
+
+        self.last_reward_terms = {}
 
     # --------------------------------------------------
     # Body lookup
@@ -123,7 +234,9 @@ class G1Env(gym.Env):
     def _find_foot_body(self, side):
         candidates = []
 
-        for body_id in range(self.model.nbody):
+        for body_id in range(
+            self.model.nbody
+        ):
             name = mujoco.mj_id2name(
                 self.model,
                 mujoco.mjtObj.mjOBJ_BODY,
@@ -144,7 +257,10 @@ class G1Env(gym.Env):
                 or "ankle" in name_lower
             ):
                 candidates.append(
-                    (body_id, name_lower)
+                    (
+                        body_id,
+                        name_lower,
+                    )
                 )
 
         if not candidates:
@@ -158,43 +274,173 @@ class G1Env(gym.Env):
             "ankle",
         ]:
             for body_id, name in candidates:
+
                 if keyword in name:
                     return body_id
 
         return candidates[0][0]
 
     # --------------------------------------------------
+    # Joint lookup
+    # --------------------------------------------------
+
+    def _find_joint_ids(
+        self,
+        keywords,
+    ):
+        ids = []
+
+        for joint_id in range(
+            self.model.njnt
+        ):
+            name = mujoco.mj_id2name(
+                self.model,
+                mujoco.mjtObj.mjOBJ_JOINT,
+                joint_id,
+            )
+
+            if name is None:
+                continue
+
+            name_lower = name.lower()
+
+            if any(
+                keyword in name_lower
+                for keyword in keywords
+            ):
+                ids.append(
+                    joint_id
+                )
+
+        return ids
+
+    def _find_hinge_qpos_indices(
+        self,
+        keywords,
+    ):
+        indices = []
+
+        for joint_id in (
+            self._find_joint_ids(
+                keywords
+            )
+        ):
+            joint_type = int(
+                self.model.jnt_type[
+                    joint_id
+                ]
+            )
+
+            if joint_type in (
+                int(
+                    mujoco.mjtJoint.mjJNT_HINGE
+                ),
+                int(
+                    mujoco.mjtJoint.mjJNT_SLIDE
+                ),
+            ):
+                indices.append(
+                    int(
+                        self.model.jnt_qposadr[
+                            joint_id
+                        ]
+                    )
+                )
+
+        return indices
+
+    # --------------------------------------------------
     # Observation
     # --------------------------------------------------
 
     def _get_obs(self):
-        return np.concatenate([
-            self.data.qpos.copy(),
-            self.data.qvel.copy(),
-            self.previous_action.copy(),
-        ]).astype(np.float32)
+        return np.concatenate(
+            [
+                self.data.qpos.copy(),
+                self.data.qvel.copy(),
+                self.previous_action.copy(),
+            ]
+        ).astype(
+            np.float32
+        )
 
     # --------------------------------------------------
     # Orientation
     # --------------------------------------------------
 
     def _rotation_matrix(self):
-        quat = self.data.qpos[3:7]
+        quat = self.data.qpos[
+            3:7
+        ]
 
-        rotation = np.zeros(9)
+        rotation = np.zeros(
+            9
+        )
 
         mujoco.mju_quat2Mat(
             rotation,
             quat,
         )
 
-        return rotation.reshape(3, 3)
+        return rotation.reshape(
+            3,
+            3,
+        )
 
     def _upright_value(self):
-        rotation = self._rotation_matrix()
-
         return float(
-            rotation[2, 2]
+            self._rotation_matrix()[
+                2,
+                2,
+            ]
+        )
+
+    # --------------------------------------------------
+    # Base velocity
+    # --------------------------------------------------
+
+    def _yaw_aligned_xy_velocity(self):
+        """
+        Express the root XY velocity in a yaw-aligned
+        robot frame.
+
+        This makes forward velocity correspond to the
+        robot's current heading instead of world +X.
+        """
+
+        rotation = (
+            self._rotation_matrix()
+        )
+
+        yaw = np.arctan2(
+            rotation[1, 0],
+            rotation[0, 0],
+        )
+
+        vx_world = float(
+            self.data.qvel[0]
+        )
+
+        vy_world = float(
+            self.data.qvel[1]
+        )
+
+        c = np.cos(yaw)
+        s = np.sin(yaw)
+
+        vx_yaw = (
+            c * vx_world
+            + s * vy_world
+        )
+
+        vy_yaw = (
+            -s * vx_world
+            + c * vy_world
+        )
+
+        return (
+            float(vx_yaw),
+            float(vy_yaw),
         )
 
     # --------------------------------------------------
@@ -202,6 +448,7 @@ class G1Env(gym.Env):
     # --------------------------------------------------
 
     def _foot_positions(self):
+
         left = self.data.xpos[
             self.left_foot_id
         ].copy()
@@ -210,11 +457,20 @@ class G1Env(gym.Env):
             self.right_foot_id
         ].copy()
 
-        return left, right
+        return (
+            left,
+            right,
+        )
 
     def _foot_velocities(self):
-        left_velocity = np.zeros(6)
-        right_velocity = np.zeros(6)
+
+        left_velocity = np.zeros(
+            6
+        )
+
+        right_velocity = np.zeros(
+            6
+        )
 
         mujoco.mj_objectVelocity(
             self.model,
@@ -234,6 +490,9 @@ class G1Env(gym.Env):
             0,
         )
 
+        # mj_objectVelocity:
+        #
+        # [angular velocity, linear velocity]
         return (
             left_velocity[3:].copy(),
             right_velocity[3:].copy(),
@@ -244,46 +503,245 @@ class G1Env(gym.Env):
     # --------------------------------------------------
 
     def _foot_contacts(self):
+        """
+        Detect foot contact with static world geometry.
+
+        body_id == 0 corresponds to MuJoCo's world body.
+
+        Restricting support contact this way prevents a
+        foot touching another G1 link from being counted
+        as valid ground support.
+        """
+
         left_contact = False
         right_contact = False
 
-        for i in range(self.data.ncon):
-            contact = self.data.contact[i]
+        for i in range(
+            self.data.ncon
+        ):
+            contact = (
+                self.data.contact[i]
+            )
 
-            geom1 = contact.geom1
-            geom2 = contact.geom2
+            body1 = int(
+                self.model.geom_bodyid[
+                    contact.geom1
+                ]
+            )
 
-            body1 = self.model.geom_bodyid[geom1]
-            body2 = self.model.geom_bodyid[geom2]
+            body2 = int(
+                self.model.geom_bodyid[
+                    contact.geom2
+                ]
+            )
 
             if (
-                body1 == self.left_foot_id
-                or body2 == self.left_foot_id
+                (
+                    body1
+                    == self.left_foot_id
+                    and body2 == 0
+                )
+                or (
+                    body2
+                    == self.left_foot_id
+                    and body1 == 0
+                )
             ):
                 left_contact = True
 
             if (
-                body1 == self.right_foot_id
-                or body2 == self.right_foot_id
+                (
+                    body1
+                    == self.right_foot_id
+                    and body2 == 0
+                )
+                or (
+                    body2
+                    == self.right_foot_id
+                    and body1 == 0
+                )
             ):
                 right_contact = True
 
-        return left_contact, right_contact
+        return (
+            left_contact,
+            right_contact,
+        )
+
+    def _update_contact_timers(
+        self,
+        left_contact,
+        right_contact,
+    ):
+
+        if left_contact:
+            self.left_contact_time += (
+                self.control_dt
+            )
+
+            self.left_air_time = 0.0
+
+        else:
+            self.left_air_time += (
+                self.control_dt
+            )
+
+            self.left_contact_time = 0.0
+
+        if right_contact:
+            self.right_contact_time += (
+                self.control_dt
+            )
+
+            self.right_air_time = 0.0
+
+        else:
+            self.right_air_time += (
+                self.control_dt
+            )
+
+            self.right_contact_time = 0.0
+
+    # --------------------------------------------------
+    # Reward helpers
+    # --------------------------------------------------
+
+    def _selective_posture_penalty(
+        self
+    ):
+
+        if not self.posture_qpos_indices:
+            return 0.0
+
+        idx = np.asarray(
+            self.posture_qpos_indices,
+            dtype=np.int32,
+        )
+
+        deviation = (
+            self.data.qpos[idx]
+            - self.stand_qpos[idx]
+        )
+
+        return float(
+            np.mean(
+                np.abs(
+                    deviation
+                )
+            )
+        )
+
+    def _ankle_soft_limit_penalty(
+        self
+    ):
+        penalties = []
+
+        for joint_id in (
+            self.ankle_joint_ids
+        ):
+
+            if not bool(
+                self.model.jnt_limited[
+                    joint_id
+                ]
+            ):
+                continue
+
+            qpos_adr = int(
+                self.model.jnt_qposadr[
+                    joint_id
+                ]
+            )
+
+            q = float(
+                self.data.qpos[
+                    qpos_adr
+                ]
+            )
+
+            low, high = (
+                self.model.jnt_range[
+                    joint_id
+                ]
+            )
+
+            span = float(
+                high - low
+            )
+
+            if span <= 1e-8:
+                continue
+
+            # Outer 10% of the allowed joint range
+            # is treated as the soft-limit area.
+            soft_low = float(
+                low
+                + 0.10 * span
+            )
+
+            soft_high = float(
+                high
+                - 0.10 * span
+            )
+
+            violation = 0.0
+
+            if q < soft_low:
+                violation = (
+                    soft_low - q
+                ) / span
+
+            elif q > soft_high:
+                violation = (
+                    q - soft_high
+                ) / span
+
+            penalties.append(
+                violation**2
+            )
+
+        if not penalties:
+            return 0.0
+
+        return float(
+            np.mean(
+                penalties
+            )
+        )
 
     # --------------------------------------------------
     # Reward
     # --------------------------------------------------
 
-    def _get_reward(self, action):
-        vx = float(self.data.qvel[0])
-        vy = float(self.data.qvel[1])
+    def _get_reward(
+        self,
+        action,
+        target_ctrl,
+    ):
 
-        roll_rate = float(self.data.qvel[3])
-        pitch_rate = float(self.data.qvel[4])
-        yaw_rate = float(self.data.qvel[5])
+        vx_yaw, vy_yaw = (
+            self._yaw_aligned_xy_velocity()
+        )
 
-        height = float(self.data.qpos[2])
-        upright = self._upright_value()
+        roll_rate = float(
+            self.data.qvel[3]
+        )
+
+        pitch_rate = float(
+            self.data.qvel[4]
+        )
+
+        yaw_rate = float(
+            self.data.qvel[5]
+        )
+
+        height = float(
+            self.data.qpos[2]
+        )
+
+        upright = (
+            self._upright_value()
+        )
 
         left_pos, right_pos = (
             self._foot_positions()
@@ -297,30 +755,48 @@ class G1Env(gym.Env):
             self._foot_contacts()
         )
 
+        self._update_contact_timers(
+            left_contact,
+            right_contact,
+        )
+
         # --------------------------------------------------
         # Velocity tracking
         # --------------------------------------------------
 
-        forward_error = (
-            vx - self.target_velocity
+        linear_velocity_error = (
+            (
+                vx_yaw
+                - self.target_velocity
+            ) ** 2
+            +
+            (
+                vy_yaw
+                - self.target_lateral_velocity
+            ) ** 2
         )
 
-        track_forward = np.exp(
-            -10.0 * forward_error**2
+        velocity_tracking = np.exp(
+            -linear_velocity_error
+            / self.velocity_tracking_std**2
         )
 
-        track_lateral = np.exp(
-            -8.0 * vy**2
+        yaw_error = (
+            yaw_rate
+            - self.target_yaw_rate
         )
 
-        velocity_tracking = (
-            track_forward * track_lateral
+        yaw_tracking = np.exp(
+            -(yaw_error**2)
+            / self.yaw_tracking_std**2
         )
 
-        forward_progress = np.clip(
-            vx / self.target_velocity,
-            0.0,
-            1.0,
+        command_active = (
+            np.hypot(
+                self.target_velocity,
+                self.target_lateral_velocity,
+            )
+            > 0.1
         )
 
         # --------------------------------------------------
@@ -328,7 +804,10 @@ class G1Env(gym.Env):
         # --------------------------------------------------
 
         upright_reward = np.clip(
-            (upright - 0.70) / 0.30,
+            (
+                upright - 0.70
+            )
+            / 0.30,
             0.0,
             1.0,
         )
@@ -348,88 +827,94 @@ class G1Env(gym.Env):
         angular_velocity_penalty = (
             roll_rate**2
             + pitch_rate**2
-            + 0.5 * yaw_rate**2
+            + 0.25 * yaw_rate**2
         )
 
         # --------------------------------------------------
-        # Alternating gait
+        # Biped gait timing
         # --------------------------------------------------
 
-        single_support = float(
-            left_contact != right_contact
-        )
-
-        contact_switch = 0.0
-
-        if (
+        single_support = (
             left_contact
-            != self.previous_left_contact
-            or right_contact
-            != self.previous_right_contact
-        ):
-            contact_switch = 1.0
-
-        gait_reward = (
-            0.7 * single_support
-            + 0.3 * contact_switch
+            != right_contact
         )
 
-        gait_reward *= forward_progress
-
-        # Count swing events
-        if (
-            self.previous_left_contact
-            and not left_contact
-        ):
-            self.left_swing_count += 1
+        air_time_reward = 0.0
 
         if (
-            self.previous_right_contact
-            and not right_contact
+            single_support
+            and command_active
         ):
-            self.right_swing_count += 1
 
-        # Symmetric stepping
-        symmetry_error = abs(
-            self.left_swing_count
-            - self.right_swing_count
-        )
+            left_mode_time = (
+                self.left_contact_time
+                if left_contact
+                else self.left_air_time
+            )
 
-        symmetry_reward = np.exp(
-            -0.5 * symmetry_error
-        )
+            right_mode_time = (
+                self.right_contact_time
+                if right_contact
+                else self.right_air_time
+            )
+
+            single_stance_time = min(
+                left_mode_time,
+                right_mode_time,
+                self.air_time_threshold,
+            )
+
+            air_time_reward = (
+                single_stance_time
+                / self.air_time_threshold
+            )
 
         # --------------------------------------------------
         # Swing-foot clearance
         # --------------------------------------------------
 
-        target_clearance = 0.08
-
         clearance_reward = 0.0
         swing_feet = 0
 
         if not left_contact:
+
+            left_clearance = (
+                left_pos[2]
+                - self.nominal_left_foot_z
+            )
+
             clearance_reward += np.exp(
                 -120.0
                 * (
-                    left_pos[2]
-                    - target_clearance
+                    left_clearance
+                    - self.target_clearance
                 ) ** 2
             )
+
             swing_feet += 1
 
         if not right_contact:
+
+            right_clearance = (
+                right_pos[2]
+                - self.nominal_right_foot_z
+            )
+
             clearance_reward += np.exp(
                 -120.0
                 * (
-                    right_pos[2]
-                    - target_clearance
+                    right_clearance
+                    - self.target_clearance
                 ) ** 2
             )
+
             swing_feet += 1
 
         if swing_feet > 0:
-            clearance_reward /= swing_feet
+
+            clearance_reward /= (
+                swing_feet
+            )
 
         # --------------------------------------------------
         # Foot sliding
@@ -438,49 +923,89 @@ class G1Env(gym.Env):
         feet_slide = 0.0
 
         if left_contact:
-            feet_slide += (
-                left_vel[0] ** 2
-                + left_vel[1] ** 2
+
+            feet_slide += float(
+                np.linalg.norm(
+                    left_vel[:2]
+                )
             )
 
         if right_contact:
-            feet_slide += (
-                right_vel[0] ** 2
-                + right_vel[1] ** 2
+
+            feet_slide += float(
+                np.linalg.norm(
+                    right_vel[:2]
+                )
             )
 
         # --------------------------------------------------
-        # Action / joint regularization
+        # Smoothness
         # --------------------------------------------------
 
-        action_rate = np.mean(
-            (
-                action
-                - self.previous_action
-            ) ** 2
-        )
-
-        action_penalty = np.mean(
-            action**2
-        )
-
-        joint_velocities = (
-            self.data.qvel[6:]
-        )
-
-        joint_velocity_penalty = (
+        # Use the actual actuator targets rather than
+        # normalized [-1, 1] policy actions.
+        action_rate = float(
             np.mean(
-                joint_velocities**2
+                (
+                    target_ctrl
+                    - self.previous_target_ctrl
+                ) ** 2
             )
         )
+
+        # --------------------------------------------------
+        # Posture and joint limits
+        # --------------------------------------------------
+
+        posture_penalty = (
+            self._selective_posture_penalty()
+        )
+
+        ankle_limit_penalty = (
+            self._ankle_soft_limit_penalty()
+        )
+
+        # --------------------------------------------------
+        # Torque / acceleration
+        # --------------------------------------------------
+
+        actuator_force = (
+            self.data.actuator_force.copy()
+        )
+
+        if len(
+            actuator_force
+        ) > 0:
+
+            torque_l2 = float(
+                np.mean(
+                    actuator_force**2
+                )
+            )
+
+        else:
+            torque_l2 = 0.0
+
+        joint_acc = (
+            self.data.qacc[6:]
+        )
+
+        if len(
+            joint_acc
+        ) > 0:
+
+            joint_acc_l2 = float(
+                np.mean(
+                    joint_acc**2
+                )
+            )
+
+        else:
+            joint_acc_l2 = 0.0
 
         # --------------------------------------------------
         # Energy
         # --------------------------------------------------
-
-        actuator_force = (
-            self.data.actuator_force
-        )
 
         joint_speed = self.data.qvel[
             6:
@@ -490,42 +1015,131 @@ class G1Env(gym.Env):
         if (
             len(joint_speed)
             == len(actuator_force)
+            and len(actuator_force) > 0
         ):
-            energy_penalty = np.mean(
-                np.abs(
-                    actuator_force
-                    * joint_speed
+
+            energy_penalty = float(
+                np.mean(
+                    np.abs(
+                        actuator_force
+                        * joint_speed
+                    )
                 )
             )
+
         else:
             energy_penalty = 0.0
 
         # --------------------------------------------------
-        # Final reward
+        # Weighted reward terms
         # --------------------------------------------------
 
-        reward = (
-            # locomotion
-            3.0 * velocity_tracking
-            + 1.0 * forward_progress
+        reward_terms = {
 
-            # gait
-            + 1.0 * gait_reward
-            + 0.40 * clearance_reward
-            + 0.30 * symmetry_reward
+            # Task
+            "velocity_tracking":
+                3.0
+                * float(
+                    velocity_tracking
+                ),
 
-            # balance
-            + 1.2 * upright_reward
-            + 0.6 * height_reward
+            "yaw_tracking":
+                0.40
+                * float(
+                    yaw_tracking
+                ),
 
-            # penalties
-            - 2.0 * orientation_penalty
-            - 0.20 * angular_velocity_penalty
-            - 0.35 * feet_slide
-            - 0.05 * action_rate
-            - 0.03 * action_penalty
-            - 0.015 * joint_velocity_penalty
-            - 0.001 * energy_penalty
+            # Gait
+            "air_time":
+                0.60
+                * float(
+                    air_time_reward
+                ),
+
+            "clearance":
+                0.20
+                * float(
+                    clearance_reward
+                ),
+
+            # Balance
+            "upright":
+                1.00
+                * float(
+                    upright_reward
+                ),
+
+            "height":
+                0.40
+                * float(
+                    height_reward
+                ),
+
+            # Stability penalties
+            "orientation":
+                -2.00
+                * float(
+                    orientation_penalty
+                ),
+
+            "angular_velocity":
+                -0.05
+                * float(
+                    angular_velocity_penalty
+                ),
+
+            # Contact quality
+            "foot_slide":
+                -0.10
+                * float(
+                    feet_slide
+                ),
+
+            # Smoothness
+            "action_rate":
+                -0.05
+                * float(
+                    action_rate
+                ),
+
+            # Pose regularization
+            "posture":
+                -0.10
+                * float(
+                    posture_penalty
+                ),
+
+            # Limits
+            "ankle_limits":
+                -1.00
+                * float(
+                    ankle_limit_penalty
+                ),
+
+            # Effort
+            "torque_l2":
+                -1.0e-5
+                * float(
+                    torque_l2
+                ),
+
+            "joint_acc_l2":
+                -1.0e-7
+                * float(
+                    joint_acc_l2
+                ),
+
+            "energy":
+                -5.0e-4
+                * float(
+                    energy_penalty
+                ),
+        }
+
+        reward = float(
+            sum(
+                reward_terms.values()
+            )
         )
 
         self.previous_left_contact = (
@@ -536,13 +1150,64 @@ class G1Env(gym.Env):
             right_contact
         )
 
-        return float(reward)
+        self.last_reward_terms = (
+            reward_terms
+        )
+
+        metrics = {
+            "vx_yaw":
+                float(
+                    vx_yaw
+                ),
+
+            "vy_yaw":
+                float(
+                    vy_yaw
+                ),
+
+            "single_support":
+                int(
+                    single_support
+                ),
+
+            "left_air_time":
+                float(
+                    self.left_air_time
+                ),
+
+            "right_air_time":
+                float(
+                    self.right_air_time
+                ),
+
+            "feet_slide_raw":
+                float(
+                    feet_slide
+                ),
+
+            "posture_penalty_raw":
+                float(
+                    posture_penalty
+                ),
+
+            "action_rate_raw":
+                float(
+                    action_rate
+                ),
+        }
+
+        return (
+            reward,
+            reward_terms,
+            metrics,
+        )
 
     # --------------------------------------------------
     # Termination
     # --------------------------------------------------
 
     def _is_terminated(self):
+
         height = float(
             self.data.qpos[2]
         )
@@ -581,7 +1246,10 @@ class G1Env(gym.Env):
         seed=None,
         options=None,
     ):
-        super().reset(seed=seed)
+
+        super().reset(
+            seed=seed
+        )
 
         mujoco.mj_resetDataKeyframe(
             self.model,
@@ -590,14 +1258,41 @@ class G1Env(gym.Env):
         )
 
         self.previous_action[:] = 0.0
+
+        self.previous_target_ctrl = (
+            self.stand_ctrl.copy()
+        )
+
         self.current_step = 0
 
-        self.left_swing_count = 0
-        self.right_swing_count = 0
+        self.left_air_time = 0.0
+        self.right_air_time = 0.0
+
+        self.left_contact_time = 0.0
+        self.right_contact_time = 0.0
+
+        self.last_reward_terms = {}
 
         mujoco.mj_forward(
             self.model,
             self.data,
+        )
+
+        # Nominal standing foot heights.
+        left_pos, right_pos = (
+            self._foot_positions()
+        )
+
+        self.nominal_left_foot_z = (
+            float(
+                left_pos[2]
+            )
+        )
+
+        self.nominal_right_foot_z = (
+            float(
+                right_pos[2]
+            )
         )
 
         left_contact, right_contact = (
@@ -621,7 +1316,11 @@ class G1Env(gym.Env):
     # Step
     # --------------------------------------------------
 
-    def step(self, action):
+    def step(
+        self,
+        action,
+    ):
+
         action = np.asarray(
             action,
             dtype=np.float32,
@@ -633,17 +1332,25 @@ class G1Env(gym.Env):
             1.0,
         )
 
+        # Position target around standing controller.
         target_ctrl = (
             self.stand_ctrl
-            + self.action_scale * action
+            + self.action_scale
+            * action
         )
 
         ctrl_min = (
-            self.model.actuator_ctrlrange[:, 0]
+            self.model.actuator_ctrlrange[
+                :,
+                0,
+            ]
         )
 
         ctrl_max = (
-            self.model.actuator_ctrlrange[:, 1]
+            self.model.actuator_ctrlrange[
+                :,
+                1,
+            ]
         )
 
         target_ctrl = np.clip(
@@ -652,7 +1359,9 @@ class G1Env(gym.Env):
             ctrl_max,
         )
 
-        self.data.ctrl[:] = target_ctrl
+        self.data.ctrl[:] = (
+            target_ctrl
+        )
 
         for _ in range(
             self.frame_skip
@@ -664,8 +1373,13 @@ class G1Env(gym.Env):
 
         self.current_step += 1
 
-        reward = self._get_reward(
-            action
+        (
+            reward,
+            reward_terms,
+            metrics,
+        ) = self._get_reward(
+            action,
+            target_ctrl,
         )
 
         terminated = (
@@ -677,11 +1391,41 @@ class G1Env(gym.Env):
             >= self.max_steps
         )
 
+        # Isaac's configuration uses a large termination
+        # penalty, but reward scaling is different there.
+        # Use a moderate direct penalty here.
+        if terminated:
+
+            termination_penalty = -5.0
+
+            reward += (
+                termination_penalty
+            )
+
+            reward_terms = dict(
+                reward_terms
+            )
+
+            reward_terms[
+                "termination"
+            ] = termination_penalty
+
+        else:
+
+            reward_terms = dict(
+                reward_terms
+            )
+
+            reward_terms[
+                "termination"
+            ] = 0.0
+
         left_contact, right_contact = (
             self._foot_contacts()
         )
 
         info = {
+
             "forward_velocity":
                 float(
                     self.data.qvel[0]
@@ -691,6 +1435,12 @@ class G1Env(gym.Env):
                 float(
                     self.data.qvel[1]
                 ),
+
+            "forward_velocity_yaw":
+                metrics["vx_yaw"],
+
+            "lateral_velocity_yaw":
+                metrics["vy_yaw"],
 
             "height":
                 float(
@@ -704,19 +1454,60 @@ class G1Env(gym.Env):
                 self.target_velocity,
 
             "left_contact":
-                int(left_contact),
+                int(
+                    left_contact
+                ),
 
             "right_contact":
-                int(right_contact),
+                int(
+                    right_contact
+                ),
+
+            "single_support":
+                metrics[
+                    "single_support"
+                ],
+
+            "left_air_time":
+                metrics[
+                    "left_air_time"
+                ],
+
+            "right_air_time":
+                metrics[
+                    "right_air_time"
+                ],
+
+            "feet_slide_raw":
+                metrics[
+                    "feet_slide_raw"
+                ],
+
+            "posture_penalty_raw":
+                metrics[
+                    "posture_penalty_raw"
+                ],
+
+            "action_rate_raw":
+                metrics[
+                    "action_rate_raw"
+                ],
+
+            "reward_terms":
+                reward_terms,
         }
 
         self.previous_action = (
             action.copy()
         )
 
+        self.previous_target_ctrl = (
+            target_ctrl.copy()
+        )
+
         return (
             self._get_obs(),
-            reward,
+            float(reward),
             terminated,
             truncated,
             info,

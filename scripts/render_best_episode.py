@@ -1,4 +1,4 @@
-import os
+from pathlib import Path
 
 import imageio
 import mujoco
@@ -10,7 +10,10 @@ from envs.g1_env import G1Env
 
 
 NUM_EPISODES = 10
-VIDEO_PATH = "results/best_episode.mp4"
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+CHECKPOINT_PATH = PROJECT_ROOT / "checkpoints" / "g1_ppo.pt"
+RESULTS_DIR = PROJECT_ROOT / "results"
+VIDEO_PATH = RESULTS_DIR / "best_episode.mp4"
 
 
 # --------------------------------------------------
@@ -35,7 +38,7 @@ agent = PPO(
 )
 
 agent.load(
-    "checkpoints/g1_ppo.pt"
+    str(CHECKPOINT_PATH)
 )
 
 agent.network.eval()
@@ -121,10 +124,7 @@ print(
 # Render best episode
 # --------------------------------------------------
 
-os.makedirs(
-    "results",
-    exist_ok=True,
-)
+RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 
 obs, _ = env.reset()
 
@@ -210,7 +210,7 @@ fps = int(
 )
 
 imageio.mimsave(
-    VIDEO_PATH,
+    str(VIDEO_PATH),
     frames,
     fps=fps,
 )
