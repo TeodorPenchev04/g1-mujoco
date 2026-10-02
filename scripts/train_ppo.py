@@ -13,7 +13,12 @@ TOTAL_TIMESTEPS = 1_000_000
 ROLLOUT_STEPS = 2048
 SMOOTH_WINDOW = 20
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+PROJECT_ROOT = (
+    Path(__file__)
+    .resolve()
+    .parents[1]
+)
 
 RESULTS_DIR = (
     PROJECT_ROOT
@@ -27,7 +32,17 @@ CHECKPOINTS_DIR = (
 
 CSV_PATH = (
     RESULTS_DIR
-    / "training_log.csv"
+    / "phase1_training_log.csv"
+)
+
+CHECKPOINT_PATH = (
+    CHECKPOINTS_DIR
+    / "g1_phase1_ppo.pt"
+)
+
+BEST_CHECKPOINT_PATH = (
+    CHECKPOINTS_DIR
+    / "g1_phase1_best.pt"
 )
 
 
@@ -42,35 +57,32 @@ CHECKPOINTS_DIR.mkdir(
 )
 
 
-# --------------------------------------------------
-# Reward terms logged from G1Env
-# --------------------------------------------------
-
 REWARD_TERM_KEYS = [
-    "velocity_tracking",
-    "yaw_tracking",
-    "air_time",
-    "clearance",
-    "upright",
-    "height",
-    "orientation",
-    "angular_velocity",
-    "foot_slide",
+    "track_lin_vel_xy",
+    "track_ang_vel_z",
+    "feet_air_time",
+    "feet_slide",
+    "dof_pos_limits",
+    "joint_deviation_hip",
+    "joint_deviation_arms",
+    "joint_deviation_fingers",
+    "joint_deviation_torso",
+    "flat_orientation",
+    "ang_vel_xy",
     "action_rate",
-    "posture",
-    "ankle_limits",
-    "torque_l2",
-    "joint_acc_l2",
-    "energy",
+    "dof_acc",
+    "dof_torques",
     "termination",
 ]
 
 
-# --------------------------------------------------
+# ======================================================
 # Environment
-# --------------------------------------------------
+# ======================================================
 
-env = G1Env()
+env = G1Env(
+    observation_noise=False
+)
 
 obs_dim = (
     env.observation_space.shape[0]
@@ -81,47 +93,55 @@ action_dim = (
 )
 
 
-# --------------------------------------------------
-# Device
-# --------------------------------------------------
-
 device = (
     "mps"
     if torch.backends.mps.is_available()
     else "cpu"
 )
 
+
+print()
+print(
+    "G1 curriculum phase 1"
+)
 print(
     "Device:",
     device,
 )
-
 print(
     "Observation dimension:",
     obs_dim,
 )
-
 print(
     "Action dimension:",
     action_dim,
 )
-
 print(
     "Target velocity:",
-    env.target_velocity,
+    env.command[0],
 )
-
+print(
+    "Action scale:",
+    env.action_scale,
+)
+print(
+    "Velocity std:",
+    env.velocity_tracking_std,
+)
 print(
     "Control dt:",
     env.control_dt,
 )
-
+print(
+    "Maximum episode length:",
+    env.max_steps,
+)
 print()
 
 
-# --------------------------------------------------
+# ======================================================
 # PPO
-# --------------------------------------------------
+# ======================================================
 
 agent = PPO(
     obs_dim=obs_dim,
@@ -129,27 +149,44 @@ agent = PPO(
     device=device,
 )
 
+# Current PPO class initializes:
+#
+# log_std = -0.5  -> std ~= 0.61
+#
+# That is very aggressive for a 29-DoF humanoid.
+# Start this curriculum with smaller exploration.
+with torch.no_grad():
+    agent.network.log_std.fill_(
+        -1.0
+    )
 
-# --------------------------------------------------
+
+# ======================================================
 # CSV
-# --------------------------------------------------
+# ======================================================
 
 csv_header = [
     "episode",
     "global_step",
+
     "episode_reward",
     "smooth_reward",
-    "mean_vx",
-    "mean_vx_yaw",
+
     "episode_length",
+
+    "mean_vx",
+    "mean_abs_velocity_error",
+
     "mean_height",
     "mean_upright",
+
     "left_contact_ratio",
     "right_contact_ratio",
     "single_support_ratio",
 ] + [
     f"mean_{key}"
-    for key in REWARD_TERM_KEYS
+    for key
+    in REWARD_TERM_KEYS
 ]
 
 
@@ -157,10 +194,9 @@ with open(
     CSV_PATH,
     "w",
     newline="",
-) as csv_file:
-
+) as file:
     writer = csv.writer(
-        csv_file
+        file
     )
 
     writer.writerow(
@@ -168,44 +204,66 @@ with open(
     )
 
 
-# --------------------------------------------------
-# Initial state
-# --------------------------------------------------
+# ======================================================
+# Stats
+# ======================================================
+
+def new_episode_stats():
+    return {
+        "reward":
+            0.0,
+
+        "vx":
+            [],
+
+        "height":
+            [],
+
+        "upright":
+            [],
+
+        "left_contact":
+            [],
+
+        "right_contact":
+            [],
+
+        "single_support":
+            [],
+
+        "reward_terms":
+            {
+                key: []
+                for key
+                in REWARD_TERM_KEYS
+            },
+    }
+
 
 obs, _ = env.reset()
 
 global_step = 0
 episode_number = 0
 
-episode_reward = 0.0
-
-episode_vx = []
-episode_vx_yaw = []
-
-episode_height = []
-episode_upright = []
-
-left_contacts = []
-right_contacts = []
-
-single_support = []
-
-reward_term_history = {
-    key: []
-    for key in REWARD_TERM_KEYS
-}
+stats = new_episode_stats()
 
 recent_rewards = deque(
     maxlen=SMOOTH_WINDOW
 )
 
+best_episode_reward = (
+    -np.inf
+)
 
-# --------------------------------------------------
+
+# ======================================================
 # Training
-# --------------------------------------------------
+# ======================================================
 
-while global_step < TOTAL_TIMESTEPS:
-
+while (
+    global_step
+    < TOTAL_TIMESTEPS
+):
     observations = []
     raw_actions = []
     rewards = []
@@ -213,14 +271,9 @@ while global_step < TOTAL_TIMESTEPS:
     log_probs = []
     values = []
 
-    # --------------------------------------------------
-    # Collect rollout
-    # --------------------------------------------------
-
     for _ in range(
         ROLLOUT_STEPS
     ):
-
         (
             action,
             raw_action,
@@ -245,7 +298,6 @@ while global_step < TOTAL_TIMESTEPS:
             or truncated
         )
 
-        # PPO rollout
         observations.append(
             obs.copy()
         )
@@ -271,73 +323,75 @@ while global_step < TOTAL_TIMESTEPS:
         )
 
         obs = next_obs
-
         global_step += 1
 
-        # --------------------------------------------------
-        # Episode statistics
-        # --------------------------------------------------
+        # ----------------------------------------------
+        # Episode stats
+        # ----------------------------------------------
 
-        episode_reward += (
-            reward
-        )
+        stats[
+            "reward"
+        ] += reward
 
-        episode_vx.append(
-            info[
-                "forward_velocity"
-            ]
-        )
-
-        episode_vx_yaw.append(
+        stats[
+            "vx"
+        ].append(
             info[
                 "forward_velocity_yaw"
             ]
         )
 
-        episode_height.append(
+        stats[
+            "height"
+        ].append(
             info[
                 "height"
             ]
         )
 
-        episode_upright.append(
+        stats[
+            "upright"
+        ].append(
             info[
                 "upright"
             ]
         )
 
-        left_contacts.append(
+        stats[
+            "left_contact"
+        ].append(
             info[
                 "left_contact"
             ]
         )
 
-        right_contacts.append(
+        stats[
+            "right_contact"
+        ].append(
             info[
                 "right_contact"
             ]
         )
 
-        single_support.append(
+        stats[
+            "single_support"
+        ].append(
             info[
                 "single_support"
             ]
         )
-
-        # --------------------------------------------------
-        # Reward breakdown
-        # --------------------------------------------------
 
         reward_terms = info.get(
             "reward_terms",
             {},
         )
 
-        for key in REWARD_TERM_KEYS:
-
-            reward_term_history[
-                key
-            ].append(
+        for key in (
+            REWARD_TERM_KEYS
+        ):
+            stats[
+                "reward_terms"
+            ][key].append(
                 float(
                     reward_terms.get(
                         key,
@@ -346,73 +400,82 @@ while global_step < TOTAL_TIMESTEPS:
                 )
             )
 
-        # --------------------------------------------------
-        # Episode completed
-        # --------------------------------------------------
+        # ----------------------------------------------
+        # End episode
+        # ----------------------------------------------
 
         if done:
-
             episode_number += 1
 
             episode_length = len(
-                episode_vx
+                stats["vx"]
             )
 
             mean_vx = float(
                 np.mean(
-                    episode_vx
+                    stats["vx"]
                 )
             )
 
-            mean_vx_yaw = float(
+            mean_abs_velocity_error = float(
                 np.mean(
-                    episode_vx_yaw
+                    np.abs(
+                        np.asarray(
+                            stats["vx"]
+                        )
+                        - env.command[0]
+                    )
                 )
             )
 
             mean_height = float(
                 np.mean(
-                    episode_height
+                    stats["height"]
                 )
             )
 
             mean_upright = float(
                 np.mean(
-                    episode_upright
+                    stats["upright"]
                 )
             )
 
             left_contact_ratio = float(
                 np.mean(
-                    left_contacts
+                    stats[
+                        "left_contact"
+                    ]
                 )
             )
 
             right_contact_ratio = float(
                 np.mean(
-                    right_contacts
+                    stats[
+                        "right_contact"
+                    ]
                 )
             )
 
             single_support_ratio = float(
                 np.mean(
-                    single_support
+                    stats[
+                        "single_support"
+                    ]
                 )
             )
 
             mean_reward_terms = {
-
                 key:
                     float(
                         np.mean(
-                            reward_term_history[
-                                key
-                            ]
+                            stats[
+                                "reward_terms"
+                            ][key]
                         )
                     )
-                    if reward_term_history[
-                        key
-                    ]
+                    if stats[
+                        "reward_terms"
+                    ][key]
                     else 0.0
 
                 for key
@@ -420,7 +483,7 @@ while global_step < TOTAL_TIMESTEPS:
             }
 
             recent_rewards.append(
-                episode_reward
+                stats["reward"]
             )
 
             smooth_reward = float(
@@ -429,41 +492,42 @@ while global_step < TOTAL_TIMESTEPS:
                 )
             )
 
-            # --------------------------------------------------
-            # Console output
-            # --------------------------------------------------
-
             print(
-                f"Episode {episode_number:4d} | "
+                f"Ep {episode_number:5d} | "
                 f"Step {global_step:7d} | "
-                f"Reward {episode_reward:8.2f} | "
+                f"R {stats['reward']:8.2f} | "
                 f"Avg {smooth_reward:8.2f} | "
-                f"vx(body) {mean_vx_yaw:6.3f} | "
-                f"Length {episode_length:4d} | "
-                f"SingleSupport "
-                f"{single_support_ratio:5.2f} | "
-                f"r_vel "
-                f"{mean_reward_terms['velocity_tracking']:5.2f} | "
-                f"r_gait "
-                f"{mean_reward_terms['air_time']:5.2f} | "
-                f"p_slide "
-                f"{mean_reward_terms['foot_slide']:6.3f}"
+                f"Len {episode_length:4d} | "
+                f"vx {mean_vx:6.3f}/0.300 | "
+                f"err {mean_abs_velocity_error:5.3f} | "
+                f"single {single_support_ratio:4.2f} | "
+                f"linR "
+                f"{mean_reward_terms['track_lin_vel_xy']:.4f} | "
+                f"airR "
+                f"{mean_reward_terms['feet_air_time']:.4f} | "
+                f"term "
+                f"{mean_reward_terms['termination']:.4f}"
             )
 
-            # --------------------------------------------------
-            # CSV row
-            # --------------------------------------------------
+            # ------------------------------------------
+            # CSV
+            # ------------------------------------------
 
             row = [
                 episode_number,
                 global_step,
-                episode_reward,
+
+                stats["reward"],
                 smooth_reward,
-                mean_vx,
-                mean_vx_yaw,
+
                 episode_length,
+
+                mean_vx,
+                mean_abs_velocity_error,
+
                 mean_height,
                 mean_upright,
+
                 left_contact_ratio,
                 right_contact_ratio,
                 single_support_ratio,
@@ -479,40 +543,38 @@ while global_step < TOTAL_TIMESTEPS:
                 CSV_PATH,
                 "a",
                 newline="",
-            ) as csv_file:
-
+            ) as file:
                 writer = csv.writer(
-                    csv_file
+                    file
                 )
 
                 writer.writerow(
                     row
                 )
 
-            # --------------------------------------------------
-            # Reset episode statistics
-            # --------------------------------------------------
+            # ------------------------------------------
+            # Best model
+            # ------------------------------------------
+
+            if (
+                stats["reward"]
+                > best_episode_reward
+            ):
+                best_episode_reward = (
+                    stats["reward"]
+                )
+
+                agent.save(
+                    str(
+                        BEST_CHECKPOINT_PATH
+                    )
+                )
 
             obs, _ = env.reset()
 
-            episode_reward = 0.0
-
-            episode_vx = []
-            episode_vx_yaw = []
-
-            episode_height = []
-            episode_upright = []
-
-            left_contacts = []
-            right_contacts = []
-
-            single_support = []
-
-            reward_term_history = {
-                key: []
-                for key
-                in REWARD_TERM_KEYS
-            }
+            stats = (
+                new_episode_stats()
+            )
 
         if (
             global_step
@@ -520,9 +582,9 @@ while global_step < TOTAL_TIMESTEPS:
         ):
             break
 
-    # --------------------------------------------------
-    # Bootstrap final value
-    # --------------------------------------------------
+    # ==================================================
+    # Bootstrap
+    # ==================================================
 
     obs_tensor = torch.as_tensor(
         obs,
@@ -533,7 +595,6 @@ while global_step < TOTAL_TIMESTEPS:
     )
 
     with torch.no_grad():
-
         next_value = (
             agent.network
             .critic(
@@ -543,9 +604,9 @@ while global_step < TOTAL_TIMESTEPS:
             .item()
         )
 
-    # --------------------------------------------------
+    # ==================================================
     # GAE
-    # --------------------------------------------------
+    # ==================================================
 
     advantages, returns = (
         agent.compute_gae(
@@ -556,21 +617,25 @@ while global_step < TOTAL_TIMESTEPS:
         )
     )
 
-    # --------------------------------------------------
+    # ==================================================
     # PPO update
-    # --------------------------------------------------
+    # ==================================================
 
     agent.update(
         observations=np.asarray(
             observations
         ),
+
         raw_actions=np.asarray(
             raw_actions
         ),
+
         old_log_probs=np.asarray(
             log_probs
         ),
+
         advantages=advantages,
+
         returns=returns,
     )
 
@@ -579,19 +644,15 @@ while global_step < TOTAL_TIMESTEPS:
         f"at step {global_step} ---"
     )
 
-    # --------------------------------------------------
-    # Save
-    # --------------------------------------------------
-
     agent.save(
         str(
-            CHECKPOINTS_DIR
-            / "g1_ppo.pt"
+            CHECKPOINT_PATH
         )
     )
 
 
 env.close()
+
 
 print()
 print(
@@ -599,6 +660,16 @@ print(
 )
 
 print(
-    f"Training log saved to: "
-    f"{CSV_PATH}"
+    "Current checkpoint:",
+    CHECKPOINT_PATH,
+)
+
+print(
+    "Best checkpoint:",
+    BEST_CHECKPOINT_PATH,
+)
+
+print(
+    "Training log:",
+    CSV_PATH,
 )

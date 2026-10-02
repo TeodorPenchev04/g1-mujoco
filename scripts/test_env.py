@@ -3,13 +3,16 @@ import numpy as np
 from envs.g1_env import G1Env
 
 
-env = G1Env()
+env = G1Env(
+    observation_noise=False
+)
 
 obs, info = env.reset()
 
 
+print()
 print(
-    "G1 environment loaded"
+    "G1 curriculum phase-1 environment"
 )
 
 print(
@@ -23,13 +26,23 @@ print(
 )
 
 print(
-    "Target velocity:",
-    env.target_velocity,
+    "Command:",
+    env.command,
 )
 
 print(
-    "Standing height:",
-    env.target_height,
+    "Action scale:",
+    env.action_scale,
+)
+
+print(
+    "Velocity tracking std:",
+    env.velocity_tracking_std,
+)
+
+print(
+    "Yaw tracking weight:",
+    env.yaw_tracking_weight,
 )
 
 print(
@@ -38,13 +51,8 @@ print(
 )
 
 print(
-    "Posture qpos indices:",
-    env.posture_qpos_indices,
-)
-
-print(
-    "Ankle joint ids:",
-    env.ankle_joint_ids,
+    "Maximum steps:",
+    env.max_steps,
 )
 
 print()
@@ -56,50 +64,49 @@ def print_step(
     reward,
     info,
 ):
-
-    terms = info.get(
-        "reward_terms",
-        {},
+    terms = (
+        info["reward_terms"]
     )
 
     print(
         f"{prefix} {step:3d} | "
-        f"reward={reward:7.3f} | "
-        f"vx_body="
-        f"{info['forward_velocity_yaw']:6.3f} | "
-        f"height="
-        f"{info['height']:6.3f} | "
-        f"upright="
-        f"{info['upright']:5.3f} | "
+        f"R={reward:8.4f} | "
+        f"vx="
+        f"{info['forward_velocity_yaw']:6.3f}/"
+        f"{info['target_velocity']:5.2f} | "
+        f"h={info['height']:5.3f} | "
+        f"up={info['upright']:5.3f} | "
         f"L/R="
         f"{info['left_contact']}/"
         f"{info['right_contact']} | "
         f"single="
         f"{info['single_support']} | "
-        f"r_vel="
-        f"{terms.get('velocity_tracking', 0.0):5.2f} | "
-        f"r_air="
-        f"{terms.get('air_time', 0.0):5.2f} | "
-        f"p_slide="
-        f"{terms.get('foot_slide', 0.0):7.4f} | "
-        f"p_rate="
-        f"{terms.get('action_rate', 0.0):7.4f}"
+        f"lin="
+        f"{terms['track_lin_vel_xy']:7.4f} | "
+        f"air="
+        f"{terms['feet_air_time']:7.4f} | "
+        f"slide="
+        f"{terms['feet_slide']:8.5f} | "
+        f"orient="
+        f"{terms['flat_orientation']:8.5f} | "
+        f"acc="
+        f"{terms['dof_acc']:8.5f} | "
+        f"torque="
+        f"{terms['dof_torques']:8.5f}"
     )
 
 
-# --------------------------------------------------
-# Test 1:
-# Zero-action standing sanity check
-# --------------------------------------------------
+# ======================================================
+# Zero-action test
+# ======================================================
 
 print(
-    "=== Zero-action sanity test ==="
+    "=== ZERO ACTION ==="
 )
 
 for step in range(
-    100
+    200
 ):
-
     action = np.zeros(
         env.action_space.shape,
         dtype=np.float32,
@@ -116,11 +123,10 @@ for step in range(
     )
 
     if (
-        step % 10 == 0
+        step % 20 == 0
         or terminated
         or truncated
     ):
-
         print_step(
             "ZERO",
             step,
@@ -132,28 +138,20 @@ for step in range(
         terminated
         or truncated
     ):
-
         print(
-            "Episode ended during "
-            "zero-action test -- resetting"
+            "Zero-action episode ended "
+            f"at step {step}."
         )
-
-        obs, info = (
-            env.reset()
-        )
-
         break
 
 
-# --------------------------------------------------
-# Test 2:
+# ======================================================
 # Small random actions
-# --------------------------------------------------
+# ======================================================
 
 print()
-
 print(
-    "=== Small-random-action test ==="
+    "=== SMALL RANDOM ACTIONS ==="
 )
 
 obs, info = env.reset()
@@ -162,12 +160,8 @@ obs, info = env.reset()
 for step in range(
     150
 ):
-
-    # Only 20% of the full action range.
-    # This is easier to inspect than completely
-    # random [-1, 1] actions.
     action = (
-        0.20
+        0.10
         * env.action_space.sample()
     )
 
@@ -186,7 +180,6 @@ for step in range(
         or terminated
         or truncated
     ):
-
         print_step(
             "RAND",
             step,
@@ -198,15 +191,10 @@ for step in range(
         terminated
         or truncated
     ):
-
         print(
-            "Episode ended -- resetting"
+            "Random-action episode ended "
+            f"at step {step}."
         )
-
-        obs, info = (
-            env.reset()
-        )
-
         break
 
 
