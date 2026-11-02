@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+.DS_Store
+.venv/
+.vscode/
+runs/
+videos/
+*.mp4
+# Only explicitly added checkpoints are tracked (they must match the current env code).
+checkpoints/*
+!checkpoints/.gitkeep
